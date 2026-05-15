@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>prescreen</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<p><a href="index.html">&larr; Home</a></p>
+<hr>
+<h1>prescreen</h1>
+<p>Task-agnostic pre-screening pipeline for OMOP concept_id extraction.
+Runs once per task. Produces an exhaustive list of relevant
+concept_ids per OMOP table and per concept-id column, ready to be
+handed to downstream event-extraction code.</p>
+<p>Five phases:</p>
+<ul>
+<li><strong>Phase 1 — direct event search.</strong> For each task, find concept_ids
+  that <em>directly</em> code the event (e.g. for NEC: SNOMED "Necrotizing
+  enterocolitis", ICD10 P77.x).</li>
+<li><strong>Phase 2 — proxy search.</strong> For each task, ask Nemotron to propose
+  <em>clinical workflow proxies</em> — patterns of EHR footprint that
+  strongly indicate the event occurred even when it was not formally
+  coded (e.g. for sepsis: blood culture + empiric antibiotics +
+  monitoring escalation). Run the Phase 1 machinery against each
+  proxy independently.</li>
+<li><strong>Phase 3 — patient coverage analysis.</strong> For each task, count
+  unique patients reachable via direct evidence and via each proxy,
+  compute overlap and proxy-only value-add. Useful both as a sanity
+  check on proxy quality and as a downstream input.</li>
+<li><strong>Phase 4 — LLM-written extraction scripts.</strong> Hand Nemotron the
+  concept_ids from Phase 1 + Phase 2 and the task description, and
+  ask it to write a Python script that combines them per the task's
+  clinical logic and outputs the final patient list. The script is
+  statically validated, then executed in a subprocess. A self-healing
+  retry loop feeds errors back to Nemotron for correction.</li>
+<li><strong>Phase 5 — audit on N.</strong> A fresh LLM call audits the patient count
+  against clinical expectations for the cohort. If N is implausible
+  (too_low / too_high / uncertain), the audit identifies suspected
+  gaps and feeds them back into a new extraction cycle. Bounded
+  outer loop; only a "plausible" verdict counts as complete.</li>
+</ul>
+<h2>What it does</h2>
+<p>For each clinical event-detection task (defined in a small YAML file):</p>
+<ol>
+<li>Asks Nemotron which OMOP tables to search for this task.</li>
+<li>For each selected table, runs <strong>two passes</strong> — one against the
+   standard concept-id column, one against the source concept-id
+   column.</li>
+<li>Per pass: asks Nemotron for a wide net of regex patterns, applies
+   them to the OMOP <code>concept</code> table, expands hits to their descendants
+   via <code>concept_ancestor</code>, matches against the cohort's data, and asks
+   Nemotron to filter the survivors for clinical relevance.</li>
+</ol>
+<p>The output is a per-task directory with the final concept_id list,
+plus the intermediate artifacts at every stage of the funnel so you
+can audit and diagnose.</p>
+<h2>Pipeline</h2>
+<pre><code>                       ┌─────────────────────────────────┐
+                       │ Nemotron #0: table selector      │  one call per task
+                       └─────────────────────────────────┘
+                                       │
+                                       ▼   chosen tables
+                                       │
+  ─── per (task, table) ─────────────────────────────────────────────────────
+                                       │
+                       splits into two passes:
+                       ┌─────────────────┬─────────────────┐
+                       │ standard pass    │ source pass     │
+                       │ *_concept_id     │ *_source_concept_id
+                       │ domain filter on │ domain filter off
+                       │ standard_only=T  │ standard_only=F │
+                       └─────────────────┴─────────────────┘
+                                       │
+                                       ▼
+                       vocab metadata for this column
+                       (which vocabularies live here)
+                                       │
+                                       ▼
+                       ┌─────────────────────────────────┐
+                       │ Nemotron #1: wide-net regex     │
+                       └─────────────────────────────────┘
+                                       │
+                                       ▼   include_patterns / exclude_patterns
+                       ┌─────────────────────────────────┐
+                       │ concept-table query              │  filters: domain,
+                       └─────────────────────────────────┘  vocabularies, standard
+                                       │
+                                       ▼   wide_net_seeds
+                       ┌─────────────────────────────────┐
+                       │ descendant expansion             │  via concept_ancestor;
+                       └─────────────────────────────────┘  re-applies filters
+                                       │
+                                       ▼   wide_net_concepts
+                                            (+ match_type: regex_seed | descendant)
+                       ┌─────────────────────────────────┐
+                       │ cohort match                     │  count rows per concept_id
+                       └─────────────────────────────────┘  in cohort data
+                                       │
+                                       ▼   cohort_match_concepts
+                       ┌─────────────────────────────────┐
+                       │ Nemotron #2: relevance filter    │  batched, json_schema strict
+                       └─────────────────────────────────┘
+                                       │
+                                       ▼
+                              final_concepts (per pass)
+                                       │
+            unioned across all (table, pass) into
+                            final_candidates.parquet
+</code></pre>
+<h2>OMOP tables searched</h2>
+<p>Each table has two searchable columns: the canonical standard
+<code>*_concept_id</code> and the source <code>*_source_concept_id</code> holding non-
+standard codes (Epic EDG, ICD9CM source, MSDW Attrib Catalog, etc.).
+Both are searched per task by default.</p>
+<table>
+<thead>
+<tr>
+<th>table</th>
+<th>standard column</th>
+<th>source column</th>
+<th>typical content</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>measurement</code></td>
+<td><code>measurement_concept_id</code></td>
+<td><code>measurement_source_concept_id</code></td>
+<td>labs, vitals, POC results (LOINC, SNOMED)</td>
+</tr>
+<tr>
+<td><code>drug_exposure</code></td>
+<td><code>drug_concept_id</code></td>
+<td><code>drug_source_concept_id</code></td>
+<td>medications, IV fluids (RxNorm, NDC)</td>
+</tr>
+<tr>
+<td><code>condition_occurrence</code></td>
+<td><code>condition_concept_id</code></td>
+<td><code>condition_source_concept_id</code></td>
+<td>diagnoses (SNOMED, ICD9CM, ICD10CM, Epic EDG)</td>
+</tr>
+<tr>
+<td><code>procedure_occurrence</code></td>
+<td><code>procedure_concept_id</code></td>
+<td><code>procedure_source_concept_id</code></td>
+<td>interventions (CPT4, HCPCS, SNOMED)</td>
+</tr>
+<tr>
+<td><code>observation</code></td>
+<td><code>observation_concept_id</code></td>
+<td><code>observation_source_concept_id</code></td>
+<td>surveys, social hx, prenatal exposures</td>
+</tr>
+<tr>
+<td><code>device_exposure</code></td>
+<td><code>device_concept_id</code></td>
+<td><code>device_source_concept_id</code></td>
+<td>ventilators, tubes, lines, implants</td>
+</tr>
+<tr>
+<td><code>visit_occurrence</code></td>
+<td><code>visit_concept_id</code></td>
+<td><code>visit_source_concept_id</code></td>
+<td>encounter type (ED, inpatient, outpatient)</td>
+</tr>
+<tr>
+<td><code>visit_detail</code></td>
+<td><code>visit_detail_concept_id</code></td>
+<td><code>visit_detail_source_concept_id</code></td>
+<td>sub-encounter unit (ICU, NICU, OR)</td>
+</tr>
+<tr>
+<td><code>death</code></td>
+<td><code>cause_concept_id</code></td>
+<td><code>cause_source_concept_id</code></td>
+<td>cause of death (SNOMED Condition)</td>
+</tr>
+</tbody>
+</table>
+<p>The table-selector LLM call picks which of these to actually run for a
+given task. Override via <code>tables:</code> in the task YAML for explicit control.</p>
+<h2>Layout</h2>
+<pre><code>prescreen/
+  __init__.py
+  config.py            # paths + EVENT_TABLES (standard + source concept_col per table)
+  cohort.py            # load_cohort, cohort_ids (cached parquet)
+  concept_table.py     # cached concept table; coerces string concept_id -&gt; Int64
+  metadata.py          # reads outputs/vocab_prescreen/{table}_*_vocab_type.csv
+  vocab.py             # query_concept(include, exclude, domain, vocabularies, standard_only)
+  expand.py            # descendant expansion via concept_ancestor
+  cohort_match.py      # count_concepts_in_cohort(table, candidate_ids, concept_col)
+  nemotron.py          # NemotronClient (auto-retries on empty / truncated / timeout)
+  llm_steps.py         # prompts + json_schemas (table-selector, wide-net, relevance)
+  proxy.py             # Phase 2 — proxy hypothesis generation + per-proxy prescreen
+  pipeline.py          # prescreen_one_table, prescreen_task, save_results
+  extraction.py        # Phase 4 — LLM-written extraction scripts (self-healing)
+  extraction_helpers.py# helpers imported by the generated scripts
+  audit.py             # Phase 5 — post-extraction audit on N (semantic retry)
+
+tasks/
+  n_acut_06_hypoglycemia.yaml
+  n_acut_04_necrotizing_enterocolitis.yaml
+
+run_prescreen.py       # Phase 1 runner
+run_proxy_prescreen.py # Phase 2 runner
+run_extraction.py      # Phase 4 runner
+patient_coverage.py    # Phase 3 — direct vs proxies, overlap + value-add
+diagnose.py            # walk artifacts and find where a table's funnel collapsed
+verify_coverage.py     # check whether a known list of concept_ids was captured
+</code></pre>
+<h2>Run</h2>
+<pre><code class="language-bash"># 1. Confirm the vLLM is reachable
+python run_prescreen.py --healthcheck
+
+# 2. Run one task
+python run_prescreen.py tasks/n_acut_06_hypoglycemia.yaml
+
+# 3. Fan out across all tasks
+python run_prescreen.py tasks/*.yaml
+</code></pre>
+<h2>Outputs</h2>
+<p>Per task, under <code>sammy/prescreen/tasks_out/{task_tag}/</code>:</p>
+<pre><code>hypoglycemia/
+  task.json
+  run_summary.json
+  final_candidates.parquet           # unified across all (table, pass)
+
+  # per (table, pass) artifacts — one set per pass:
+  condition_occurrence__standard__patterns.json
+  condition_occurrence__standard__vocab_metadata.parquet
+  condition_occurrence__standard__wide_net_seeds.parquet
+  condition_occurrence__standard__wide_net_concepts.parquet
+  condition_occurrence__standard__cohort_match_concepts.parquet
+  condition_occurrence__standard__decisions.parquet
+  condition_occurrence__standard__final_concepts.parquet
+
+  condition_occurrence__source__patterns.json
+  condition_occurrence__source__vocab_metadata.parquet
+  ...
+
+  drug_exposure__standard__...
+  drug_exposure__source__...
+  measurement__standard__...
+  measurement__source__...
+</code></pre>
+<p><code>final_candidates.parquet</code> carries <code>source_table</code>, <code>search_pass</code>
+(<code>standard</code> / <code>source</code>), and <code>source_concept_col</code> columns so each
+concept tells you which (table, pass) it came from.</p>
+<h2>Helper scripts</h2>
+<p><strong><code>diagnose.py {task_tag} {table}</code></strong> — walks the artifacts for one
+table, prints sizes at each stage of both passes, and tells you the
+first empty stage. Use it whenever a table comes back lighter than
+expected.</p>
+<pre><code class="language-bash">python diagnose.py hypoglycemia condition_occurrence            # both passes
+python diagnose.py hypoglycemia condition_occurrence --pass source
+</code></pre>
+<p><strong><code>verify_coverage.py {task_tag} --csv known_ids.csv</code></strong> — given a
+known list of concept_ids (e.g. from a gold-standard phenotype, a
+prior chart-review set, or an ad-hoc cohort check), reports what
+fraction the prescreen captured, broken down by which pass found
+them, and prints the names of anything missed.</p>
+<pre><code class="language-bash">python verify_coverage.py hypoglycemia --csv my_known_glycemia_ids.csv
+python verify_coverage.py hypoglycemia --ids 4129519,4226798,4280953
+</code></pre>
+<h2>YAML knobs</h2>
+<p>A minimal task only needs <code>task_id</code>, <code>task_tag</code>, and <code>description</code>.
+Optional fields, in approximate order of usefulness:</p>
+<table>
+<thead>
+<tr>
+<th>field</th>
+<th>default</th>
+<th>effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>positive_examples</code></td>
+<td><code>[]</code></td>
+<td>concept names that SHOULD match; seeds the wide-net LLM call. Cover all plausible domains (LOINC, RxNorm, SNOMED, etc.) you expect Nemotron to generate patterns for.</td>
+</tr>
+<tr>
+<td><code>negative_examples</code></td>
+<td><code>[]</code></td>
+<td>concept names that should NOT match; used to direct the wide-net's exclude patterns.</td>
+</tr>
+<tr>
+<td><code>tables</code></td>
+<td><code>"auto"</code></td>
+<td>which tables to search. <code>"auto"</code> (or omitted) = Nemotron picks. <code>"all"</code> = every configured table. Explicit list = exactly those.</td>
+</tr>
+<tr>
+<td><code>search_source_concepts</code></td>
+<td><code>true</code></td>
+<td>whether to run the source pass alongside the standard pass for each table. Set false for tasks strictly defined on standard concepts.</td>
+</tr>
+<tr>
+<td><code>expand_descendants</code></td>
+<td><code>true</code></td>
+<td>whether to expand each regex-matched seed concept to its descendants via <code>concept_ancestor</code> before the cohort match.</td>
+</tr>
+<tr>
+<td><code>concept_col_overrides</code></td>
+<td><code>{}</code></td>
+<td>per-table override for the standard pass's concept_col (rarely needed).</td>
+</tr>
+<tr>
+<td><code>domain_overrides</code></td>
+<td><code>{}</code></td>
+<td>per-table override for the standard pass's domain filter (rarely needed).</td>
+</tr>
+</tbody>
+</table>
+<h2>Phase 2: proxy prescreen</h2>
+<p>Clinicians often operationalize treatment before formal diagnosis
+coding. The diagnosis sometimes never gets coded, but the workflow
+leaves a detectable trail. Sepsis is the canonical example: in a NICU
+the workflow</p>
+<pre><code>clinical deterioration → blood cultures drawn → empiric
+broad-spectrum antibiotics → monitoring escalation → maybe
+diagnosis later
+</code></pre>
+<p>leaves an unambiguous electronic footprint even when the sepsis
+diagnosis never lands in the record. Phase 2 catches these cases.</p>
+<p>For each task, Phase 2 asks Nemotron to propose <strong>proxy hypotheses</strong> —
+distinct workflow patterns whose presence in the record strongly
+indicates the target event occurred. Each proposed proxy comes with a
+<strong>clinical rationale</strong> that gets saved verbatim, and is then run
+through the same Phase 1 machinery (table selector, wide-net regex per
+(table, pass), descendant expansion, cohort match, relevance filter)
+as if it were a hand-written task.</p>
+<pre><code>parent task
+   │
+   ▼
+┌────────────────────────────────────────┐
+│ Nemotron #P: proxy hypothesis generator │   one call per task
+└────────────────────────────────────────┘
+   │
+   ▼  list of proxies, each with:
+        proxy_tag, rationale, description,
+        positive_examples, negative_examples
+   │
+   ▼  for each proxy: feed into prescreen_task as if it were hand-written
+   │
+   ▼
+Phase 1 pipeline (table-selector + per-(table, pass) wide-net + …)
+   │
+   ▼
+proxies/{proxy_tag}/  — full Phase-1 artifact set
+</code></pre>
+<p>The proxies for one parent task are <strong>siloed</strong> under that task's
+output directory but <strong>linked</strong> by their position in the tree. Each
+proxy has its own <code>final_candidates.parquet</code>; nothing cross-contaminates
+the parent task's direct-event final list.</p>
+<h3>Run</h3>
+<pre><code class="language-bash"># 1. Phase 1 first (so direct-event concepts are on disk).
+python run_prescreen.py tasks/n_acut_04_necrotizing_enterocolitis.yaml
+
+# 2. Phase 2 — generate proxies + prescreen each.
+python run_proxy_prescreen.py tasks/n_acut_04_necrotizing_enterocolitis.yaml
+</code></pre>
+<p>Phase 2 doesn't require Phase 1 to have been run, but most users will
+run them in order so the Phase 1 outputs sit next to the <code>proxies/</code>
+subtree.</p>
+<h3>Outputs</h3>
+<pre><code>necrotizing_enterocolitis/                         # parent task (Phase 1)
+  task.json
+  run_summary.json
+  final_candidates.parquet                         # directly-coded NEC concepts
+  condition_occurrence__standard__final_concepts.parquet
+  ...
+
+  proxies/                                         # Phase 2
+    _proxy_hypotheses.json                         # all proxies + overall rationale + Nemotron reasoning trace
+    _proxy_index.json                              # proxy_tag -&gt; rationale summary -&gt; output_dir
+
+    surgical_intervention_for_nec/
+      rationale.md                                 # WHY this proxy is valid (saved verbatim, human-readable)
+      proxy_definition.yaml                        # auto-generated task definition
+      task.json                                    # machine-readable copy with _proxy_rationale stowed
+      run_summary.json
+      final_candidates.parquet                     # THIS proxy's concepts
+      procedure_occurrence__standard__patterns.json
+      procedure_occurrence__standard__final_concepts.parquet
+      ...
+
+    sustained_npo_plus_tpn_initiation/
+      ...
+</code></pre>
+<h3>Reading saved rationales</h3>
+<p>For QA, grep across <code>proxies/*/rationale.md</code>. For programmatic access
+(downstream LLM steps that want to read prior reasoning) pull from the
+JSON manifest:</p>
+<pre><code class="language-python">import json
+from prescreen.config import TASKS_OUT
+
+manifest = json.loads((TASKS_OUT / &quot;necrotizing_enterocolitis&quot; /
+                       &quot;proxies&quot; / &quot;_proxy_hypotheses.json&quot;).read_text())
+for p in manifest[&quot;proxies&quot;]:
+    print(p[&quot;proxy_tag&quot;])
+    print(&quot;  rationale:&quot;, p[&quot;rationale&quot;])
+    print(&quot;  description:&quot;, p[&quot;description&quot;])
+</code></pre>
+<p>Each proxy's own <code>task.json</code> also carries the rationale as
+<code>_proxy_rationale</code>, so the rationale travels with the task definition
+itself.</p>
+<h3>Helpers work transparently on proxy paths</h3>
+<p><code>diagnose.py</code> and <code>verify_coverage.py</code> accept any nested path under
+<code>TASKS_OUT</code>, so you can point them at a proxy directory without
+modification:</p>
+<pre><code class="language-bash">python diagnose.py necrotizing_enterocolitis/proxies/surgical_intervention_for_nec procedure_occurrence
+python verify_coverage.py necrotizing_enterocolitis/proxies/sustained_npo_plus_tpn --csv known_nec_ids.csv
+</code></pre>
+<h2>Phase 3: patient coverage analysis</h2>
+<p>For each task, count unique cohort patients matched by direct
+evidence and by each proxy, then compute overlap and proxy-only
+value-add. Useful as a sanity check on proxy quality and as input to
+downstream analyses.</p>
+<pre><code class="language-bash">python patient_coverage.py                                    # all tasks
+python patient_coverage.py --task-tag necrotizing_enterocolitis
+python patient_coverage.py --combined-csv sammy/coverage_all.csv
+</code></pre>
+<p>Writes <code>{task_tag}/patient_coverage.json</code> (summary across direct + all
+proxies) and <code>{task_tag}/proxies/{proxy_tag}/patient_coverage.json</code>
+(per-proxy detail). See the script docstring for output schema.</p>
+<p>Headline numbers per proxy:</p>
+<ul>
+<li><code>n_overlap</code> — patients with both direct and proxy evidence</li>
+<li><code>n_only_in_proxy</code> — patients only the proxy reached (proxy's value-add)</li>
+<li><code>n_only_in_direct</code> — patients with diagnosis but no proxy workflow</li>
+<li><code>jaccard_vs_direct</code> — overlap / union</li>
+</ul>
+<h2>Phase 4: LLM-written extraction scripts</h2>
+<p>The closing of the loop. For each task, Nemotron writes a Python
+script that combines the prescreened direct and proxy concept_ids
+into the final patient list according to task-specific clinical logic.
+The script is statically validated (AST parse, banned-imports
+allowlist, required call to <code>write_patient_ids</code>), then executed in a
+subprocess with a timeout. On failure, the error is fed back to
+Nemotron for a corrected attempt — self-healing up to a bounded number
+of tries.</p>
+<pre><code>Phase 1 concept_ids + Phase 2 proxy concept_ids + task description
+                          │
+                          ▼
+       ┌────────────────────────────────────────┐
+       │ Nemotron #E: extraction script writer  │   up to N attempts;
+       │   sees task + helpers + previous errors│   feeds errors back
+       └────────────────────────────────────────┘
+                          │
+                          ▼   {task_tag}.py
+       ┌────────────────────────────────────────┐
+       │ Static validation                       │   AST parse, no banned
+       │   (banned imports, required call)       │   imports, must call
+       └────────────────────────────────────────┘   write_patient_ids()
+                          │
+                          ▼
+       ┌────────────────────────────────────────┐
+       │ Subprocess execution                    │   30-min default timeout
+       └────────────────────────────────────────┘
+                          │
+                          ▼
+                 patient_ids.parquet
+</code></pre>
+<h3>Helpers (used by the generated scripts)</h3>
+<p>Nemotron is instructed to import from <code>prescreen.extraction_helpers</code>
+rather than reimplement parquet plumbing. The helpers encode the
+canonical pushdown patterns:</p>
+<pre><code class="language-python">from prescreen.extraction_helpers import (
+    load_direct_concepts,            # Phase 1 final_candidates as DataFrame
+    load_proxy_concepts,             # Phase 2 final_candidates (all or one proxy)
+    query_events,                    # pushdown read of one event table
+    query_events_from_candidates,    # iterates query_events for a candidates DF
+    patient_set,                     # -&gt; set[int] of unique person_ids
+    union, intersect, difference,    # set ops sugar
+    write_patient_ids,               # REQUIRED — canonical output writer
+)
+</code></pre>
+<h3>Run</h3>
+<pre><code class="language-bash">python run_extraction.py tasks/n_acut_04_necrotizing_enterocolitis.yaml
+python run_extraction.py tasks/*.yaml --max-attempts 3
+</code></pre>
+<h3>Outputs</h3>
+<pre><code>tasks_out/necrotizing_enterocolitis/
+  ...                                # Phase 1 + 2 + 3 artifacts as before
+
+  extraction/                        # NEW (Phase 4)
+    necrotizing_enterocolitis.py     # the generated script (latest attempt)
+    extraction_rationale.md          # Nemotron's logic + clinical rationale
+    extraction_reasoning.txt         # Nemotron's reasoning trace (if available)
+    extraction_run.log               # latest attempt's stdout/stderr
+    patient_ids.parquet              # the final answer
+    extraction_summary.json          # status, n_patients, attempt_count, history
+
+    attempts/                        # per-attempt audit trail
+      attempt_1.py
+      attempt_1.log
+      attempt_2.py
+      attempt_2.log
+      ...
+</code></pre>
+<p><code>patient_ids.parquet</code> schema:</p>
+<table>
+<thead>
+<tr>
+<th>column</th>
+<th>type</th>
+<th>description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>person_id</code></td>
+<td>int64</td>
+<td>the patient</td>
+</tr>
+<tr>
+<td><code>criteria_met</code></td>
+<td>bool</td>
+<td>always true (for join compatibility)</td>
+</tr>
+<tr>
+<td><code>label</code></td>
+<td>str</td>
+<td>caller-defined (e.g. "combined", "direct_only")</td>
+</tr>
+<tr>
+<td><code>n_supporting_events</code></td>
+<td>int64 (optional)</td>
+<td>how many event rows supported the match</td>
+</tr>
+<tr>
+<td><code>earliest_event_date</code></td>
+<td>date (optional)</td>
+<td>first matching event</td>
+</tr>
+</tbody>
+</table>
+<h3>Self-healing retry</h3>
+<p>If an attempt fails — validation rejection, runtime non-zero return,
+timeout, or missing output — the orchestrator captures the error and
+the previous code and asks Nemotron to fix it on the next attempt.
+Older attempts get one-line summaries in the retry prompt; the most
+recent attempt gets its full code shown so Nemotron can <em>edit</em> rather
+than regenerate from scratch.</p>
+<p>After a batch run, this jq one-liner sorts tasks by how many attempts
+they needed (highest first — your "review me" list):</p>
+<pre><code class="language-bash">for f in sammy/prescreen/tasks_out/*/extraction/extraction_summary.json; do
+    jq -r '. | &quot;\(.attempt_count) \(.status) \(.task_tag) \(.n_patients // &quot;—&quot;)&quot;' &quot;$f&quot;
+done | sort -k1,1nr -k2,2
+</code></pre>
+<h3>Helpers work transparently on extraction outputs</h3>
+<pre><code class="language-bash">python verify_coverage.py necrotizing_enterocolitis --csv known_nec_ids.csv
+# (compares against tasks_out/necrotizing_enterocolitis/final_candidates.parquet)
+</code></pre>
+<p>For a verify pass against the <em>extracted patient list</em> rather than the
+concept list, point at <code>extraction/patient_ids.parquet</code> instead.</p>
+<h2>Phase 5: audit on N</h2>
+<p>Phase 4 produces a script and an N. Phase 5 asks: is N plausible?</p>
+<p>A fresh LLM call (independent of the extraction model, so it can't
+defend its own logic) reviews the task description, cohort size,
+final N, evidence inventory (direct + per-proxy concept counts), and
+the script's combining logic. It returns one of four verdicts:
+<strong>plausible</strong>, <strong>too_low</strong>, <strong>too_high</strong>, or <strong>uncertain</strong>. For the
+non-plausible cases it lists specific suspected gaps with rationale
+and a suggested remedy each.</p>
+<p>If the verdict is non-plausible, the gaps are formatted as feedback
+and fed into a fresh extraction cycle. The new script sees the
+original task brief plus the audit's complaints from the previous
+cycle. Bounded by <code>--max-audit-cycles</code> (default 2 — so up to 1
+initial extraction + 1 audit-driven retry).</p>
+<p>The two retry layers nest cleanly:</p>
+<pre><code>extract_with_audit (outer — semantic retry on N)
+    for cycle in 1..max_audit_cycles:
+        extract_for_task (inner — code-error retry from Phase 4)
+            for attempt in 1..max_attempts:
+                Nemotron writes script
+                validate + run
+                if technical failure: feed error back, retry
+        audit the result
+        if verdict == &quot;plausible&quot;: done
+        else: format gaps as external_feedback, loop
+</code></pre>
+<p>Different feedback at each layer: technical (traceback) inside,
+semantic (clinical gaps) outside.</p>
+<h3>Run</h3>
+<pre><code class="language-bash">python run_extraction.py tasks/n_acut_01_antibiotic_discontinuation.yaml
+# audit is on by default
+
+python run_extraction.py tasks/foo.yaml --max-audit-cycles 3
+python run_extraction.py tasks/foo.yaml --no-audit
+</code></pre>
+<h3>Outputs (Phase 5 additions)</h3>
+<pre><code>tasks_out/antibiotic_discontinuation/extraction/
+  ...                          # Phase 4 artifacts unchanged
+
+  audit_report.md              # NEW — polished markdown of the LATEST
+                               #       cycle's audit (verdict + gaps)
+  audit_history.md             # NEW — running log across all cycles
+  audit_history.json           # NEW — structured record of each cycle:
+                               #       verdict, n_patients, gaps, timestamp
+</code></pre>
+<p><code>audit_report.md</code> is intended to be readable by a clinical reviewer
+with no engineering context. Headline N + percent, verdict badge,
+auditor's reasoning paragraph, evidence inventory tables, extraction
+logic summary, and a numbered list of suspected gaps each with its
+rationale and suggested remedy.</p>
+<p><code>audit_history.json</code> lets you mine the audit trail across all 100
+tasks programmatically. For instance, to find tasks that survived
+audit on cycle 1 vs cycle 2 vs failed:</p>
+<pre><code class="language-bash">for f in sammy/prescreen/tasks_out/*/extraction/audit_history.json; do
+    jq -r '.[-1] | &quot;\(.cycle) \(.verdict) \(.n_patients)&quot;' &quot;$f&quot;
+done | sort -k1,1n -k2,2
+</code></pre>
+<h3>When Phase 5 helps vs doesn't</h3>
+<p>Helps:
+- The script ran cleanly but used <code>AND</code> where <code>OR</code> belongs
+- A source-pass concept inventory was empty for a key table and the
+  script ignored it instead of flagging
+- A temporal window was too restrictive
+- A proxy with rich coverage wasn't combined into the final set</p>
+<p>Doesn't help:
+- N is <em>actually</em> low because the event is genuinely rare in the
+  cohort. The auditor will say "plausible" and we move on.
+- The task description itself is wrong or ambiguous. Phase 5 will
+  fire repeatedly without converging; the fix is upstream.
+- Phase 1/2 missed concepts that aren't recoverable from any
+  re-combining of what's there. The audit can suggest "include
+  source pass for drug_exposure" but if Phase 1 found zero in that
+  pass, the rewrite has nothing to work with. The audit will flag
+  this with a specific gap pointing at the empty pass — useful
+  signal for going back and re-running Phase 1 with better seeds.</p>
+<h2>Design notes</h2>
+<ul>
+<li>
+<p><strong>Three LLM calls per task, then two per (table, pass).</strong> The
+  table-selector runs once. Each <code>(table, pass)</code> runs a wide-net
+  regex generation call and a (batched) relevance-filter call. All
+  three use vLLM's strict <code>json_schema</code> response format so outputs are
+  well-typed and don't require defensive parsing.</p>
+</li>
+<li>
+<p><strong>Two passes per table.</strong> Standard <code>*_concept_id</code> columns hold the
+  canonical OMOP mapping; source <code>*_source_concept_id</code> columns hold
+  the original institutional / vocabulary codes (Epic EDG, ICD9CM
+  source, MSDW, etc.). The source pass turns off <code>standard_only</code> and
+  the domain filter, but restricts to vocabularies actually present
+  on the source column at this site, then leans on the cohort match
+  to prune. This catches non-standard codes that have no clean
+  standard mapping (or that map up to a coarser parent).</p>
+</li>
+<li>
+<p><strong>Descendant expansion via <code>concept_ancestor</code>.</strong> After the regex
+  hits the concept table we expand each seed to its descendants before
+  the cohort match. This is what catches brand-named drug products
+  ("Baqsimi" for glucagon), SNOMED subtypes, and other hierarchy-only
+  members that the concept-name regex would never see. The same
+  filters used to produce the seed set are re-applied to descendants
+  so they don't drift across categories. Each expanded concept gets a
+  <code>match_type</code> column (<code>regex_seed</code> vs <code>descendant</code>) so QC can
+  attribute final hits to either path.</p>
+</li>
+<li>
+<p><strong>Wide-net LLM gets the vocab distribution.</strong> For each pass the LLM
+  is handed the list of vocabularies on the column being searched
+  with their concept counts and row counts. This lets it lean into
+  the right vocabularies (RxNorm-shaped patterns for drug standard,
+  ICD-shaped patterns for condition source) instead of guessing. The
+  source pass also gets an explicit note that the candidates are
+  non-standard and may use institution-specific phrasing.</p>
+</li>
+<li>
+<p><strong>Cohort match drops dead candidates.</strong> If a concept has zero rows
+  in the cohort we don't waste an LLM token asking whether it's
+  relevant. Each surviving candidate carries a per-cohort row count
+  so the relevance filter knows what's high-volume.</p>
+</li>
+<li>
+<p><strong>Relevance filter is batched</strong> at 200 concepts per call. Each
+  decision carries a one-line reason that gets persisted alongside
+  the final list.</p>
+</li>
+<li>
+<p><strong>Caching.</strong> The cohort, concept, and concept_ancestor tables are
+  cached as parquet under <code>sammy/prescreen/cache/</code> so each task
+  starts in seconds rather than re-reading the full vocabulary tables
+  from <code>output/</code>.</p>
+</li>
+<li>
+<p><strong>String-vs-int concept_id quirk.</strong> The vocab table stores
+  <code>concept_id</code> as strings at this site. <code>concept_table.load_concept</code>
+  and <code>expand.load_concept_ancestor</code> coerce to nullable <code>Int64</code> once
+  at load time and cache the result; every downstream caller sees
+  ints.</p>
+</li>
+</ul>
+<h2>Open items / next iteration</h2>
+<ul>
+<li>Temporal anchoring (turn concept_id list into per-person event
+  timestamps relative to a cohort index date). Out of scope for the
+  prescreen — that's the next task.</li>
+<li>Chunking the cohort-match parquet filter when the candidate set is
+  large (&gt;~10k concept_ids). Rare but possible for very broad tasks
+  or generous source passes.</li>
+<li>A "second-look" loop on the wide-net regex: feed the LLM a small
+  sample of <code>concept_name</code> rows that were <em>near misses</em> (matched
+  include patterns but were knocked out by exclude patterns) and let
+  it refine. Cheap and would catch poorly-worded exclude patterns.</li>
+<li>Per-task cost telemetry: total LLM calls, total tokens, wall clock,
+  written to <code>run_summary.json</code> for budget tracking across 100 tasks.</li>
+</ul>
+</body>
+</html>
