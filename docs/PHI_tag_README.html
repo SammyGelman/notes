@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>phi_tagging</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<p><a href="index.html">&larr; Home</a></p>
+<hr>
+<h1>phi_tagging</h1>
+<p>PHI flagging and RxNorm/CVX mapping for unmapped OMOP drug source concepts. A three-stage pipeline against the self-hosted Nemotron-3-Super endpoint on Minerva (same B200 vLLM server used by <code>clinical_extractor</code>).</p>
+<p>The input is a CSV of <code>(DRUG_SOURCE_CONCEPT_ID, DRUG_SOURCE_CONCEPT_NAME, DRUG_CONCEPT_ID, DRUG_CONCEPT_NAME)</code> tuples where most rows have <code>DRUG_CONCEPT_ID = 0</code> ("No matching concept"). These are legacy free-text entries clinicians and systems typed in place of proper drug codes, often decades ago. They fall into three buckets the pipeline disentangles:</p>
+<ul>
+<li><strong>PHI-contaminated drug entries</strong> — provider names, site identifiers, study IDs, MRNs that leaked into the drug name field.</li>
+<li><strong>Devices and non-drug supplies</strong> — colostomy bags, insulin needles, syringes, dressings; these have no RxNorm equivalent.</li>
+<li><strong>Actual unmapped drugs</strong> — strings like <code>MILRINONE IV BOLUS</code> or <code>LEVOTHYROXINE 37.5 MCG CAPSULE</code> that need standardization to RxNorm (or CVX for vaccines).</li>
+</ul>
+<h2>Pipeline architecture</h2>
+<p>Three sibling JSONL output files, all joined by <code>source_concept_id</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Engine</th>
+<th>Input</th>
+<th>Output</th>
+<th>File</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1. triage</td>
+<td>Nemotron, batched</td>
+<td><code>(source_id, source_name)</code> from CSV</td>
+<td>PHI flag + categories + evidence; item kind (drug/device/procedure/unknown); cleaned drug string</td>
+<td><code>triage.jsonl</code></td>
+</tr>
+<tr>
+<td>2. candidates</td>
+<td>rapidfuzz over <code>concept.parquet</code> filtered to standard RxNorm + CVX</td>
+<td><code>cleaned_drug_string</code> from stage 1</td>
+<td>top-N candidate concepts with fuzzy scores</td>
+<td><code>candidates.jsonl</code></td>
+</tr>
+<tr>
+<td>3. mapping</td>
+<td>Nemotron, batched</td>
+<td>cleaned string + candidate shortlist</td>
+<td>best pick (or decline) + confidence + rationale</td>
+<td><code>mapping.jsonl</code></td>
+</tr>
+</tbody>
+</table>
+<p>The split between stage 1 (classification) and stage 3 (mapping) is intentional. Classification is bulk-friendly and benefits from short, mechanical prompts. Mapping needs candidates riding alongside each row and produces denser output. Conflating them in one prompt makes both worse.</p>
+<p>Stage 2 is deliberately deterministic — no LLM. It's a fuzzy index lookup, fully reproducible, and several orders of magnitude cheaper than another model call. Two queries per row (see below), unioned by concept_id with max-score-wins.</p>
+<p>Every output file is written <strong>append-style with a flush after each batch</strong>, so a job killed mid-run leaves a partial-but-valid file. Re-running the same command resumes in place — each stage skips <code>source_concept_id</code>s already present in its output. This matters at 40K rows where the full run takes 20+ hours.</p>
+<h2>Stage 1: triage</h2>
+<p>A single batched call to Nemotron with strict JSON-schema output. The prompt classifies each row along three axes:</p>
+<ol>
+<li>
+<p><strong>PHI status.</strong> Provider/patient names, MRNs, dates, phone numbers, site identifiers that uniquely identify a location, and institutional study identifiers (e.g., <code>GCO#21-2239</code>). The model is instructed to be conservative — false positives are cheap to review later, missed PHI is not. The prompt explicitly excludes pharma compound codes (<code>MK-6482</code>-style) since those identify molecules, not people.</p>
+</li>
+<li>
+<p><strong>Item kind.</strong> <code>drug</code> / <code>device</code> / <code>procedure_or_other</code> / <code>unknown</code>. Devices and procedures short-circuit stage 2 (no candidates retrieved, auto-decline at stage 3).</p>
+</li>
+<li>
+<p><strong><code>cleaned_drug_string</code>.</strong> If a drug name is present even alongside PHI or device text, extract just the drug portion (with dose/form/route) and strip the rest. Null when <code>kind != drug</code>.</p>
+</li>
+</ol>
+<h3>PHI consistency invariant</h3>
+<p>Pydantic's <code>model_validator</code> on <code>TriageResult</code> enforces: <code>has_phi=True</code> implies non-empty <code>phi_categories</code> and non-null <code>phi_evidence</code>. If Nemotron returns <code>has_phi=true</code> with empty categories or null evidence (observed in early testing), the validator coerces to <code>["other"]</code> and a placeholder evidence string. The inverse contradiction (<code>has_phi=false</code> with stray categories) is cleared. Downstream code can rely on the invariant.</p>
+<h3>Reliability machinery</h3>
+<p>Nemotron in reasoning mode tends to either spend its entire token budget on row 1 of a multi-row batch, or emit duplicates and skips, or quietly swap names between rows. The pipeline defends against all three:</p>
+<ul>
+<li>
+<p><strong>Reasoning is disabled</strong> via NVIDIA's <code>detailed thinking off</code> directive, prepended to the system message. Triage is mechanical classification; per-row reasoning eats tokens and gains nothing. Mapping uses the same setting — the fuzzy candidates do the heavy lifting.</p>
+</li>
+<li>
+<p><strong><code>triage_with_retry</code></strong> recursively halves the batch on any of these failures:</p>
+</li>
+<li>Missing IDs (model returned fewer results than requested)</li>
+<li>Unknown IDs (model invented an ID we didn't send)</li>
+<li>Name swaps (model returned a correct ID with the wrong <code>source_concept_name</code> attached — corrupts every other field for that row)</li>
+<li>
+<p>Down to single-row calls, where there's nothing left to swap or skip.</p>
+</li>
+<li>
+<p><strong>Always-dedup, always in input order.</strong> Even on the happy path the result list is deduplicated by <code>source_concept_id</code> and re-sorted by the input order. Guards against the model emitting multiple copies of the same row.</p>
+</li>
+<li>
+<p><strong><code>map_with_retry</code></strong> does the analogous thing for stage 3.</p>
+</li>
+</ul>
+<p>The default batch size is 10/10. We've validated this is stable. Pushing to 25+ produced short batches with reasoning on; thinking off lets you ramp up, but 10 is the safe baseline.</p>
+<h2>Stage 2: candidates</h2>
+<p>Deterministic fuzzy retrieval against a pre-loaded index over <code>concept.parquet</code>, filtered to <code>vocabulary_id ∈ {RxNorm, CVX}</code>, <code>standard_concept = 'S'</code>, <code>domain_id = 'Drug'</code>. Default index size on the peds_fm export: ~155K standard concepts.</p>
+<h3>Two-query retrieval</h3>
+<p>Each row hits the index twice. Results are unioned by <code>concept_id</code>, keeping the higher rapidfuzz score per concept, then truncated to top-N.</p>
+<p><strong>Query 1: dose-unit normalized.</strong> The <code>cleaned_drug_string</code> is rewritten so EHR-style strength expressions match RxNorm's canonical form:</p>
+<ul>
+<li><code>37.5 MCG</code> → <code>0.0375 MG</code></li>
+<li><code>0.9 %</code> → <code>9 MG/ML</code></li>
+</ul>
+<p>Without this, <code>LEVOTHYROXINE 37.5 MCG CAPSULE</code> fails to retrieve <code>levothyroxine sodium 0.0375 MG Oral Capsule</code> despite the concept being right there in the index — the fuzzy matcher just can't bridge MCG↔MG. Similarly <code>SODIUM CHLORIDE 0.9 % IV BOLUS</code> doesn't reach <code>sodium chloride 9 MG/ML Injectable Solution</code> without the normalization.</p>
+<p><strong>Query 2: ingredient/brand tokens only.</strong> Numbers, units, dose forms, and routes are stripped from the source string, leaving just ingredient and brand names. This catches brand-name lookups that get drowned out by the dose-form noise in query 1.</p>
+<p>The motivating failure: <code>FANAPT 6 MG TABLET</code> against the full string scores best against other "X 6 MG Oral Tablet" concepts (sennosides, risperidone, etc.) because the shared <code>6 MG Oral Tablet</code> tokens dominate. With just <code>FANAPT</code> as the query, <code>iloperidone 6 MG Oral Tablet [Fanapt]</code> floats to the top. Same fix for <code>ADLARITY</code> → <code>donepezil ... [Adlarity]</code>.</p>
+<p>The stoplist in <code>normalize.py:PHARM_STOPWORDS</code> covers units, dosage forms, routes, common descriptors. Brand and ingredient names are intentionally not on it.</p>
+<h3>Auto-decline path</h3>
+<p>If <code>triage.kind != drug</code>, <code>candidates_for_triage</code> short-circuits to an empty list — no fuzzy lookup runs. Stage 3 then auto-declines those rows without consulting the LLM, costing zero tokens and zero latency. Devices, procedures, and unknown-kind rows all flow through this path.</p>
+<h2>Stage 3: mapping</h2>
+<p>Per row, Nemotron sees the cleaned source string plus its candidate shortlist (concept_id, name, vocabulary_id, class, fuzzy_score) and picks one or declines. The prompt emphasizes that the fuzzy score is informative but not authoritative — a 95-score candidate can still be wrong (wrong salt form, wrong dose), a 60-score candidate can be right.</p>
+<p>Confidence rubric in the system prompt:</p>
+<ul>
+<li>0.90 – 1.00: exact or near-exact match on ingredient + dose + form.</li>
+<li>0.70 – 0.90: ingredient + form match; dose missing or approximate.</li>
+<li>0.50 – 0.70: ingredient match only; dose/form absent or mismatched.</li>
+<li>&lt; 0.50: weak — prefer to decline.</li>
+</ul>
+<p>"Prefer specificity" is also explicit: if both an Ingredient concept and a Clinical Drug match, pick the Clinical Drug. In practice the model picks Quant Clinical Drug (with volume) when the source has volume info — <code>CLEVIDIPINE 25 MG/50 ML INTRAVENOUS EMULSION → 50 ML clevidipine 0.5 MG/ML Injection @ 0.95</code> is a clean example.</p>
+<p>When the model declines, <code>chosen_concept_id = null</code> and the rationale explains why. Common decline reasons in practice: combination products where no single candidate covers all ingredients (Zatean-PN Plus, Vivonex RTF, Glucosamine Chondroitin), ambiguous source strings, and form/strength mismatches.</p>
+<h2>Deployment</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Model</td>
+<td><code>nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4</code></td>
+</tr>
+<tr>
+<td>vLLM</td>
+<td>0.17.1, <code>--max-num-seqs 4</code>, <code>--gpu-memory-utilization 0.85</code></td>
+</tr>
+<tr>
+<td>Host</td>
+<td>Minerva B200 (183 GB)</td>
+</tr>
+<tr>
+<td>Port</td>
+<td>8000, OpenAI-compatible <code>/v1</code></td>
+</tr>
+<tr>
+<td>Sampling</td>
+<td><code>temperature=1.0, top_p=0.95</code> (NVIDIA's guidance)</td>
+</tr>
+<tr>
+<td>Reasoning</td>
+<td>disabled per-call via <code>detailed thinking off</code></td>
+</tr>
+<tr>
+<td>Structured output</td>
+<td><code>response_format: {type: "json_schema", strict: true}</code></td>
+</tr>
+<tr>
+<td>Conda env</td>
+<td><code>/sc/arion/scratch/gelmas07/venvs/nemotron-env</code></td>
+</tr>
+</tbody>
+</table>
+<p>The Nemotron server is launched separately under an LSF <code>bsub</code> job; see <code>clinical_extractor</code>'s README for the launch command. This pipeline assumes the server is reachable at <code>http://localhost:8000/v1</code> (override with <code>NEMOTRON_BASE_URL</code>).</p>
+<h2>Install</h2>
+<pre><code class="language-bash">module purge
+ml proxies
+ml anaconda3/2025.06
+conda activate /sc/arion/scratch/gelmas07/venvs/nemotron-env
+
+cd /sc/arion/projects/EHR_ML/sgelman/phi_tagging
+pip install -e .
+</code></pre>
+<h2>Smoke test</h2>
+<p>Always run the smoke before the full job. It runs all three stages on 25 rows and prints a per-row summary so you can eyeball whether PHI/device/drug calls look sane and whether mappings are landing on plausible RxNorm concepts.</p>
+<pre><code class="language-bash">python scripts/smoke_test.py \
+    --csv phi_tagging/drug_mapping.csv \
+    --limit 25 \
+    --fresh
+</code></pre>
+<p>Expected runtime: 30–90 seconds. Output goes to <code>/sc/arion/scratch/gelmas07/phi_tagging/smoke/</code>.</p>
+<p>Sanity checks on the smoke:</p>
+<ul>
+<li>All 25 input IDs appear in <code>triage.jsonl</code>, each exactly once.</li>
+<li><code>kind</code> distribution roughly 85% drug, 10–15% device, rest procedure/unknown.</li>
+<li>No "Triage: name swap" warnings, or if there are, they're followed by successful retries.</li>
+<li>Mapping picks should hit confidence ≥ 0.85 on common drugs (Clevidipine, Luspatercept, Levothyroxine, Griseofulvin, etc.).</li>
+<li>Declines should land on legitimate combo products and enteral nutrition.</li>
+</ul>
+<h2>Full run</h2>
+<pre><code class="language-bash">python scripts/run_pipeline.py \
+    --csv phi_tagging/drug_mapping.csv \
+    --out-dir /sc/arion/scratch/gelmas07/phi_tagging/run01 \
+    --triage-batch 10 \
+    --mapping-batch 10 \
+    --candidates-n 20 \
+    2&gt;&amp;1 | tee /sc/arion/scratch/gelmas07/phi_tagging/run01.log
+</code></pre>
+<p>Run inside <code>tmux</code> or <code>screen</code> — the vLLM server lives in the same LSF job, so a dropped SSH session takes the model with it. Verify the LSF job's <code>-W</code> wall time covers the projected runtime before launching.</p>
+<p>Expected runtime on 40K rows at default batch sizes: <strong>15–25 hours</strong> in the typical case. Watch the tqdm rate during the first 10 minutes to get a real estimate (<code>Xs/it</code> × 4000 batches ≈ stage 1 time).</p>
+<h3>Resuming after a crash</h3>
+<p>Re-run the exact same command. Every stage reads its output file and skips IDs already present.</p>
+<h3>Re-running just one stage</h3>
+<p>To re-run stage 3 after editing the mapping prompt:</p>
+<pre><code class="language-bash">rm /sc/arion/scratch/gelmas07/phi_tagging/run01/mapping.jsonl
+python scripts/run_pipeline.py \
+    --csv phi_tagging/drug_mapping.csv \
+    --out-dir /sc/arion/scratch/gelmas07/phi_tagging/run01 \
+    --skip-triage --skip-candidates
+</code></pre>
+<h3>Running stage 3 concurrently with stage 1</h3>
+<p>Stage 1 takes most of the wall time. Once triage is partway through, you can launch a second pipeline run in another tmux pane that consumes whatever triage has produced so far and runs stages 2 and 3 on it. vLLM's <code>--max-num-seqs 4</code> lets the server multiplex requests across both clients without contention.</p>
+<pre><code class="language-bash"># In tmux pane 2, while the main run is still doing triage:
+python scripts/run_pipeline.py \
+    --csv phi_tagging/drug_mapping.csv \
+    --out-dir /sc/arion/scratch/gelmas07/phi_tagging/run01 \
+    --skip-triage
+</code></pre>
+<p>This is the way to get early mapping output if you don't want to wait for stage 1 to fully complete.</p>
+<h2>Monitoring a running job</h2>
+<pre><code class="language-bash">RUN=/sc/arion/scratch/gelmas07/phi_tagging/run01
+
+# Progress
+wc -l $RUN/triage.jsonl
+
+# PHI flag rate and kind distribution
+python -c &quot;
+import json
+from collections import Counter
+c = Counter()
+with open('$RUN/triage.jsonl') as f:
+    for line in f:
+        r = json.loads(line)
+        c[('phi' if r['has_phi'] else 'clean', r['kind'])] += 1
+for k, v in sorted(c.items()):
+    print(f'{v:7d}  {k}')
+&quot;
+
+# Sample recent PHI-flagged rows
+grep '\&quot;has_phi\&quot;:true' $RUN/triage.jsonl | tail -5 | python -m json.tool
+</code></pre>
+<p>If PHI rate looks wildly off (smoke ran roughly 0–10%; if production drifts to 30%+ something is mistuned), pause and inspect.</p>
+<h2>Output schemas</h2>
+<p>See <code>src/phi_tagging/models.py</code> for full Pydantic definitions. Headline fields:</p>
+<p><strong><code>TriageResult</code></strong> (one per input row):
+- <code>source_concept_id: int</code>, <code>source_concept_name: str</code>
+- <code>has_phi: bool</code>, <code>phi_categories: list[PHICategory]</code>, <code>phi_evidence: Optional[str]</code>
+- <code>kind: ItemKind</code> — one of <code>drug</code>, <code>device</code>, <code>procedure_or_other</code>, <code>unknown</code>
+- <code>cleaned_drug_string: Optional[str]</code> — null when <code>kind != drug</code>
+- <code>rationale: Optional[str]</code></p>
+<p><strong><code>CandidatesForRow</code></strong> (one per input row):
+- <code>source_concept_id</code>, <code>source_concept_name</code>, <code>cleaned_drug_string</code>
+- <code>candidates: list[CandidateMatch]</code> — each with <code>concept_id</code>, <code>concept_name</code>, <code>vocabulary_id</code>, <code>concept_class_id</code>, <code>concept_code</code>, <code>score</code> (0–100 rapidfuzz)</p>
+<p><strong><code>MappingDecision</code></strong> (one per input row, declining or picking):
+- <code>source_concept_id</code>
+- <code>chosen_concept_id: Optional[int]</code> — null when declined
+- <code>chosen_concept_name</code>, <code>chosen_vocabulary_id</code>
+- <code>confidence: float</code> (0.0–1.0)
+- <code>rationale: str</code></p>
+<h3>Loading results in pandas</h3>
+<pre><code class="language-python">import pandas as pd
+
+run = &quot;/sc/arion/scratch/gelmas07/phi_tagging/run01&quot;
+df_t = pd.read_json(f&quot;{run}/triage.jsonl&quot;,     lines=True)
+df_c = pd.read_json(f&quot;{run}/candidates.jsonl&quot;, lines=True)
+df_m = pd.read_json(f&quot;{run}/mapping.jsonl&quot;,    lines=True)
+
+# Everything flagged as PHI
+phi_rows = df_t.query(&quot;has_phi == True&quot;)
+
+# All high-confidence mappings ready to commit
+high_conf = df_m.dropna(subset=[&quot;chosen_concept_id&quot;]).query(&quot;confidence &gt;= 0.85&quot;)
+
+# Join all three on source_concept_id
+joined = df_t.merge(df_m, on=&quot;source_concept_id&quot;, suffixes=(&quot;_t&quot;, &quot;_m&quot;))
+</code></pre>
+<h2>Tuning knobs</h2>
+<table>
+<thead>
+<tr>
+<th>Knob</th>
+<th>Default</th>
+<th>When to change</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--triage-batch</code></td>
+<td>10</td>
+<td>Bump to 20 if you see zero short-batch warnings on the smoke; drop to 5 if you see many.</td>
+</tr>
+<tr>
+<td><code>--mapping-batch</code></td>
+<td>10</td>
+<td>Same logic. Mapping batches are denser (10 rows × 20 candidates each), so lower is safer.</td>
+</tr>
+<tr>
+<td><code>--candidates-n</code></td>
+<td>20</td>
+<td>Raise to 30 if you see many "no candidate matches" declines on real drugs; lower to 10 if stage 3 is getting noisy candidate lists.</td>
+</tr>
+<tr>
+<td><code>score_cutoff</code> in <code>vocab.top_n</code></td>
+<td>40</td>
+<td>Raise to 50–60 to be stricter about candidate quality; lower to widen the net for unusual products.</td>
+</tr>
+<tr>
+<td><code>thinking</code> in <code>client.structured</code></td>
+<td>False</td>
+<td>Set to <code>True</code> if mapping picks look dumb on hard cases. Accepts ~5x slowdown for stage 3 in exchange.</td>
+</tr>
+</tbody>
+</table>
+<p>Concept index filter in <code>vocab.py</code>: currently <code>vocabulary_id ∈ {RxNorm, CVX} AND standard_concept = 'S' AND domain_id = 'Drug'</code>. Including non-standard branded variants might help brand-name retrieval but balloon the index.</p>
+<h2>Known limitations</h2>
+<p><strong>Combo products often decline.</strong> Multi-ingredient sources like Zatean-PN, Vivonex RTF, Glucosamine Chondroitin consistently decline because fuzzy matching on long combo strings is noisy and the combo Clinical Drug concepts rarely surface in the top-N. RxNorm does have these; we just don't retrieve them well. A fix would be ingredient-token search (split source into ingredient names, retrieve per-token, intersect) but it adds complexity for limited gain on a small fraction of the corpus.</p>
+<p><strong>Devices have no target vocabulary.</strong> RxNorm/CVX cover drugs only. Devices auto-decline at stage 3. Mapping them would require a parallel pipeline against SNOMED device hierarchy or HCPCS supply codes — same architecture, different concept filter. Out of scope for v1.</p>
+<p><strong>Reasoning trace is captured but not persisted.</strong> <code>NemotronClient.structured</code> returns <code>(parsed, reasoning_content)</code> but the pipeline currently drops the reasoning. If audit needs grow, add a sibling <code>reasoning.jsonl</code> per stage keyed by batch index.</p>
+<p><strong>Single-client throughput.</strong> The pipeline runs sequentially against one vLLM endpoint. <code>--max-num-seqs 4</code> means the server can handle 4 concurrent requests; running stage 1 and stage 3 in parallel tmux panes (above) is the lightweight way to use that headroom. A real fix would be asyncio + concurrent batch submission, which is a bigger refactor.</p>
+<h2>File layout</h2>
+<pre><code>phi_tagging/
+├── pyproject.toml
+├── README.md                          # this file
+├── phi_tagging/
+│   └── drug_mapping.csv               # input CSV (place yours here)
+├── src/phi_tagging/
+│   ├── __init__.py
+│   ├── client.py                      # OpenAI-compat wrapper around vLLM
+│   ├── models.py                      # Pydantic schemas, PHI validator
+│   ├── normalize.py                   # MCG→MG, %→MG/ML, ingredient tokens
+│   ├── vocab.py                       # ConceptIndex, two-query top_n
+│   ├── triage.py                      # stage 1 prompt + retry-with-name-check
+│   ├── candidates.py                  # stage 2 deterministic retrieval
+│   ├── mapping.py                     # stage 3 prompt + retry-with-dedup
+│   └── pipeline.py                    # orchestration, jsonl I/O, resume
+└── scripts/
+    ├── smoke_test.py                  # 25-row end-to-end with sample print
+    └── run_pipeline.py                # full-run CLI with --skip-* flags
+</code></pre>
+<p>Outputs live in <code>/sc/arion/scratch/gelmas07/phi_tagging/&lt;run-name&gt;/</code> by default:</p>
+<pre><code>run01/
+├── triage.jsonl          # stage 1 output, append-flushed per batch
+├── candidates.jsonl      # stage 2 output
+└── mapping.jsonl         # stage 3 output
+</code></pre>
+</body>
+</html>
